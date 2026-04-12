@@ -1,0 +1,5 @@
+# sodapy: último 1.x es 1.5.5; la rama 2.x sigue en PyPI (no hay 1.6).
+sodapy>=1.5.5,<3
+python-dotenv>=1.0,<2
+streamlit>=1.28,<2
+pandas>=2.0,<3
