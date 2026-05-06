@@ -9,3 +9,6 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+# Large local export (do not commit)
+export.csv
