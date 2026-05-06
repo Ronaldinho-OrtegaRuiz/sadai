@@ -28,7 +28,7 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from sadai.config import soda_app_token, soda_token_meta  # noqa: E402
-from sadai.secop_soda import count_contracts  # noqa: E402
+from sadai.data_sources.secop_soda import count_contracts  # noqa: E402
 
 # Valores frecuentes en datos abiertos (acento / mayúsculas). Se prueba en orden.
 _DEFAULT_CANDIDATES = (

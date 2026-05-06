@@ -16,8 +16,8 @@ from common_setup import EXPORT_CSV, init_app
 init_app()
 
 from filtros_region import render_sidebar_filtros  # noqa: E402
-from sadai.analitica_local import contratos_por_departamento_df  # noqa: E402
-from sadai.colombia_geo import (  # noqa: E402
+from sadai.analytics.analitica_local import contratos_por_departamento_df  # noqa: E402
+from sadai.geo.colombia_geo import (  # noqa: E402
     GEOJSON_URL,
     build_norm_to_dpto_cnmbr,
     choropleth_series,
@@ -25,12 +25,12 @@ from sadai.colombia_geo import (  # noqa: E402
     norm_departamento_label,
     secop_departamento_to_geo_key,
 )
-from sadai.colombia_municipios import (  # noqa: E402
+from sadai.geo.colombia_municipios import (  # noqa: E402
     GEOJSON_MPIO_URL,
     find_municipio_feature,
     load_municipios_geojson,
 )
-from sadai.export_csv_duckdb import count_contracts_filtered  # noqa: E402
+from sadai.data_sources.export_csv_duckdb import count_contracts_filtered  # noqa: E402
 
 st.set_page_config(page_title="Mapa territorial — SADAI", layout="wide")
 st.title("Mapa territorial")
@@ -45,9 +45,9 @@ if not EXPORT_CSV.is_file():
 
 dept_sel, ciudad_sel, year = render_sidebar_filtros()
 
-_ROOT = Path(__file__).resolve().parents[1]
-_LOCAL_GEO = _ROOT / "data" / "geo" / "departamentos.geojson"
-_LOCAL_MPIO = _ROOT / "data" / "geo" / "municipios.geojson"
+_REPO_ROOT = EXPORT_CSV.parent
+_LOCAL_GEO = _REPO_ROOT / "data" / "geo" / "departamentos.geojson"
+_LOCAL_MPIO = _REPO_ROOT / "data" / "geo" / "municipios.geojson"
 
 
 @st.cache_data(ttl=300, show_spinner=False)

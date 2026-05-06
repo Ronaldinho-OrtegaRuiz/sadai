@@ -12,7 +12,7 @@ import duckdb
 import requests
 
 from sadai.config import SECOP_CONTRATOS_DATASET_ID
-from sadai.secop_soda import secop_client
+from sadai.data_sources.secop_soda import secop_client
 
 GEO_CATALOG_FILENAME = "secop_geo_catalog.json"
 

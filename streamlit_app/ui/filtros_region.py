@@ -9,6 +9,8 @@ import streamlit as st
 from common_setup import EXPORT_CSV, cached_api_catalog, init_app
 
 ALL_CITIES_LABEL = "(Todas las ciudades del departamento)"
+DEFAULT_DEPTO = "Bolívar"
+DEFAULT_CITY = "Cartagena"
 
 
 def render_sidebar_filtros() -> tuple[str, str | None, int]:
@@ -30,6 +32,9 @@ def render_sidebar_filtros() -> tuple[str, str | None, int]:
         "Cambios aquí se reflejan al volver a esa página."
     )
 
+    if "region_departamento" not in st.session_state and DEFAULT_DEPTO in depts:
+        st.session_state["region_departamento"] = DEFAULT_DEPTO
+
     cur_dept = st.session_state.get("region_departamento")
     idx_dept = depts.index(cur_dept) if cur_dept in depts else 0
     dept = st.sidebar.selectbox("Departamento", options=depts, index=idx_dept, key="filtro_sidebar_dept")
@@ -37,6 +42,9 @@ def render_sidebar_filtros() -> tuple[str, str | None, int]:
     cities_map: dict[str, list[str]] = catalog.get("ciudades_por_departamento") or {}
     cities = cities_map.get(dept, [])
     city_choices = [ALL_CITIES_LABEL] + cities
+
+    if "region_ciudad_token" not in st.session_state and DEFAULT_CITY in city_choices:
+        st.session_state["region_ciudad_token"] = DEFAULT_CITY
 
     cur_tok = st.session_state.get("region_ciudad_token", "")
     if cur_tok:
@@ -47,7 +55,7 @@ def render_sidebar_filtros() -> tuple[str, str | None, int]:
     city_label = st.sidebar.selectbox("Ciudad", options=city_choices, index=idx_city, key="filtro_sidebar_city")
     ciudad_token: str | None = None if city_label == ALL_CITIES_LABEL else city_label
 
-    from sadai.export_csv_duckdb import fecha_inicio_anos_rango  # noqa: PLC0415
+    from sadai.data_sources.export_csv_duckdb import fecha_inicio_anos_rango  # noqa: PLC0415
 
     y_min, y_max = fecha_inicio_anos_rango(EXPORT_CSV, dept, ciudad_token)
     year_opts = list(range(y_min, y_max + 1))

@@ -24,7 +24,7 @@ _SRC = _ROOT / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from sadai.secop_soda import contracts_grouped_by_ciudad, count_contracts  # noqa: E402
+from sadai.data_sources.secop_soda import contracts_grouped_by_ciudad, count_contracts  # noqa: E402
 
 # En SECOP II este dataset suele traer la ciudad como "Cartagena" (no el nombre oficial largo).
 _CARTAGENA_WHERE_EXAMPLES = (

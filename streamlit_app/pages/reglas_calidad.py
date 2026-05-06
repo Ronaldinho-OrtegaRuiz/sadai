@@ -15,7 +15,7 @@ from common_setup import EXPORT_CSV, init_app
 init_app()
 
 from filtros_region import render_sidebar_filtros  # noqa: E402
-from sadai.analitica_local import reglas_muestra_df, reglas_resumen  # noqa: E402
+from sadai.analytics.analitica_local import reglas_muestra_df, reglas_resumen  # noqa: E402
 
 st.set_page_config(page_title="Reglas y coherencia — SADAI", layout="wide")
 st.title("Reglas y coherencia")

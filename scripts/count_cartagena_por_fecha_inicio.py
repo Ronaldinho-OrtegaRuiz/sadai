@@ -27,7 +27,7 @@ _SRC = _ROOT / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from sadai.secop_soda import count_contracts  # noqa: E402
+from sadai.data_sources.secop_soda import count_contracts  # noqa: E402
 
 _GEO_BOLIVAR_DEPTO = "departamento = 'Bolívar'"
 _GEO_CARTAGENA = "departamento = 'Bolívar' AND ciudad = 'Cartagena'"

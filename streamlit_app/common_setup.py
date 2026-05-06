@@ -23,6 +23,6 @@ def init_app() -> None:
 @st.cache_data(ttl=3600, show_spinner=True)
 def cached_api_catalog() -> dict:
     init_app()
-    from sadai.geo_catalog import fetch_dept_ciudad_catalog_via_api
+    from sadai.data_sources.geo_catalog import fetch_dept_ciudad_catalog_via_api
 
     return fetch_dept_ciudad_catalog_via_api()

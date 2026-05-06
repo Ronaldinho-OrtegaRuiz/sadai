@@ -8,7 +8,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from sadai.colombia_geo import norm_departamento_label
+from sadai.geo.colombia_geo import norm_departamento_label
 
 GEOJSON_MPIO_URL = (
     "https://raw.githubusercontent.com/caticoa3/colombia_mapa/master/"

@@ -25,20 +25,20 @@ st.markdown(
 )
 
 lista = st.Page(
-    "lista_contratos.py",
+    "pages/lista_contratos.py",
     title="Lista de Contratos",
     default=True,
 )
 reglas = st.Page(
-    "reglas_calidad.py",
+    "pages/reglas_calidad.py",
     title="Reglas y coherencia",
 )
 exploracion = st.Page(
-    "exploracion_estadistica.py",
+    "pages/exploracion_estadistica.py",
     title="Indicadores y patrones",
 )
 mapa = st.Page(
-    "mapa_territorial.py",
+    "pages/mapa_territorial.py",
     title="Mapa territorial",
 )
 nav = st.navigation([lista, reglas, exploracion, mapa])

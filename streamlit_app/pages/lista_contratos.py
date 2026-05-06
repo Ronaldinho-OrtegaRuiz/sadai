@@ -16,13 +16,15 @@ from common_setup import CSV_STR, EXPORT_CSV, cached_api_catalog, init_app
 
 init_app()
 
-from sadai.export_csv_duckdb import (  # noqa: E402
+from sadai.data_sources.export_csv_duckdb import (  # noqa: E402
     count_contracts_filtered,
     fecha_inicio_anos_rango,
     fetch_contracts_page_df,
 )
 
 ALL_CITIES_LABEL = "(Todas las ciudades del departamento)"
+DEFAULT_DEPTO = "Bolívar"
+DEFAULT_CITY = "Cartagena"
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -80,6 +82,9 @@ if not depts_all:
     st.error("La API devolvió un catálogo vacío.")
     st.stop()
 
+if "region_departamento" not in st.session_state and DEFAULT_DEPTO in depts_all:
+    st.session_state["region_departamento"] = DEFAULT_DEPTO
+
 def_dept = st.session_state.get("region_departamento")
 idx_dept = depts_all.index(def_dept) if def_dept in depts_all else 0
 dept = st.selectbox("Departamento", options=depts_all, index=idx_dept, key="sel_dept")
@@ -93,6 +98,9 @@ cities_for_dept = cities_map.get(dept, [])
 
 city_choices = [ALL_CITIES_LABEL] + cities_for_dept
 tok = st.session_state.get("region_ciudad_token", "")
+if not tok and DEFAULT_CITY in city_choices:
+    st.session_state["region_ciudad_token"] = DEFAULT_CITY
+    tok = DEFAULT_CITY
 if tok:
     def_city = tok if tok in city_choices else ALL_CITIES_LABEL
 else:

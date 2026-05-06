@@ -22,22 +22,22 @@ La app usa variables del archivo `.env` (ver `.env.example`). Para el catálogo 
 
 La navegación está en `streamlit_app/app.py` (multipage con `st.navigation`).
 
-- **Lista de Contratos** (`streamlit_app/lista_contratos.py`)
+- **Lista de Contratos** (`streamlit_app/pages/lista_contratos.py`)
   - Filtros: departamento, ciudad (opcional), año (según “Fecha de Inicio del Contrato”).
   - Tabla paginada desde `export.csv` usando DuckDB.
 
-- **Reglas y coherencia** (`streamlit_app/reglas_calidad.py`)
+- **Reglas y coherencia** (`streamlit_app/pages/reglas_calidad.py`)
   - Reglas determinísticas (auditoría de coherencia temporal, valor, texto).
   - KPIs + gráfico de distribución de alertas + tabla enriquecida (muestra) y descarga CSV.
 
-- **Indicadores y patrones** (`streamlit_app/exploracion_estadistica.py`)
+- **Indicadores y patrones** (`streamlit_app/pages/exploracion_estadistica.py`)
   - Dispersión valor vs duración.
   - Histograma de costo por día.
   - Top modalidades y mediana de valor.
   - Serie mensual de contratos.
   - Concentración proveedor–entidad.
 
-- **Mapa territorial** (`streamlit_app/mapa_territorial.py`)
+- **Mapa territorial** (`streamlit_app/pages/mapa_territorial.py`)
   - **Mapa 1**: Colombia completa (coroplética por departamento) para el año seleccionado.
   - **Mapa 2**: zoom al departamento del filtro y, si hay ciudad elegida, se resalta el **municipio** (capa encima).
   - Incluye ranking (barras) + descarga del agregado por departamento.
@@ -56,7 +56,7 @@ Las columnas vienen del `export.csv` (nombres con espacios). Ejemplos:
 
 ### Derivadas
 
-En `src/sadai/analitica_local.py`:
+En `src/sadai/analytics/analitica_local.py`:
 
 - **`duracion_dias`**: `date_diff('day', inicio, fin)` (si existen ambas fechas)
 - **`longitud_objeto`**: `length(trim(objeto))`
@@ -77,11 +77,11 @@ Se exponen como flags (0/1):
 
 ## Estructura relevante
 
-- `src/sadai/export_csv_duckdb.py`: conteo / paginación desde `export.csv`
-- `src/sadai/analitica_local.py`: reglas + métricas + agregados
-- `src/sadai/geo_catalog.py`: cliente API para depto/ciudad (catálogo)
-- `src/sadai/colombia_geo.py`: GeoJSON departamentos (DANE) + homologación
-- `src/sadai/colombia_municipios.py`: GeoJSON municipios (DANE) + match municipio dentro del depto
+- `src/sadai/data_sources/export_csv_duckdb.py`: conteo / paginación desde `export.csv`
+- `src/sadai/analytics/analitica_local.py`: reglas + métricas + agregados
+- `src/sadai/data_sources/geo_catalog.py`: cliente API para depto/ciudad (catálogo)
+- `src/sadai/geo/colombia_geo.py`: GeoJSON departamentos (DANE) + homologación
+- `src/sadai/geo/colombia_municipios.py`: GeoJSON municipios (DANE) + match municipio dentro del depto
 - `streamlit_app/`: UI multipágina
 
 ## GeoJSON (sin red / performance)
