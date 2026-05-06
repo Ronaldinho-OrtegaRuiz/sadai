@@ -34,10 +34,6 @@ from sadai.data_sources.export_csv_duckdb import count_contracts_filtered  # noq
 
 st.set_page_config(page_title="Mapa territorial — SADAI", layout="wide")
 st.title("Mapa territorial")
-st.caption(
-    "**(1)** Colombia completa; **(2)** zoom al **departamento** del lateral y, si elegiste **ciudad** "
-    "(no “todas”), se remarca el **municipio** DANE encima. Año = inicio del contrato."
-)
 
 if not EXPORT_CSV.is_file():
     st.error("No se encontró `export.csv`.")
@@ -48,6 +44,17 @@ dept_sel, ciudad_sel, year = render_sidebar_filtros()
 _REPO_ROOT = EXPORT_CSV.parent
 _LOCAL_GEO = _REPO_ROOT / "data" / "geo" / "departamentos.geojson"
 _LOCAL_MPIO = _REPO_ROOT / "data" / "geo" / "municipios.geojson"
+
+
+def _dept_label_ranking(nombre: str) -> str:
+    """Etiqueta corta en el ranking para nombres muy largos (p. ej. Bogotá D.C.)."""
+    s = str(nombre).strip()
+    if not s or s.lower() in ("nan", "none"):
+        return "(Sin nombre)"
+    low = s.lower()
+    if "distrito capital" in low or "bogot" in low:
+        return "Bogotá (D.C.)"
+    return s
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -123,6 +130,14 @@ if geo is not None and norm_map:
         margin=dict(l=0, r=0, t=28, b=0),
         height=520,
         title="1. Colombia — todos los departamentos",
+        coloraxis_colorbar=dict(
+            title="Contratos",
+            tickformat=",.0f",
+            outlinecolor="#ccc",
+            outlinewidth=1,
+            len=0.82,
+            thickness=16,
+        ),
     )
     fig_map.update_geos(
         fitbounds="locations",
@@ -144,6 +159,7 @@ if geo is not None and norm_map:
         if sub_feats:
             geo_one: dict = {"type": "FeatureCollection", "features": sub_feats}
             n_dep = _contratos_para_departamento(df, dept_sel)
+            n_city_leyenda: int | None = None
 
             fig_dep = go.Figure()
             fig_dep.add_trace(
@@ -155,8 +171,7 @@ if geo is not None and norm_map:
                     colorscale=[[0, "#c8e6c9"], [1, "#43a047"]],
                     marker_line_width=1.2,
                     marker_line_color="#1b5e20",
-                    showscale=True,
-                    colorbar=dict(title="Contratos (dept)", len=0.55, y=0.55),
+                    showscale=False,
                     name="Departamento",
                     hovertemplate=(
                         f"<b>{dept_sel}</b><br>"
@@ -183,6 +198,7 @@ if geo is not None and norm_map:
                                 EXPORT_CSV, dept_sel, ciudad_sel, year
                             )
                         )
+                        n_city_leyenda = n_city
                         geo_mpio_one = {
                             "type": "FeatureCollection",
                             "features": [mpio_feat],
@@ -196,8 +212,7 @@ if geo is not None and norm_map:
                                 colorscale=[[0, "#ffe0b2"], [1, "#ef6c00"]],
                                 marker_line_width=2.8,
                                 marker_line_color="#bf360c",
-                                showscale=True,
-                                colorbar=dict(title="Contratos (ciudad)", len=0.45, y=0.2),
+                                showscale=False,
                                 name="Municipio",
                                 hovertemplate=(
                                     f"<b>{ciudad_sel}</b> ({mpio_key})<br>"
@@ -218,14 +233,35 @@ if geo is not None and norm_map:
                         f"URL: `{GEOJSON_MPIO_URL}` o archivo `{_LOCAL_MPIO.as_posix()}`."
                     )
 
+            leyenda_parts = [
+                f"<span style='color:#2e7d32'>■</span> Departamento (año): <b>{n_dep:,}</b> contratos",
+            ]
+            if n_city_leyenda is not None and ciudad_sel:
+                leyenda_parts.append(
+                    f"<span style='color:#e65100'>■</span> Ciudad <b>{ciudad_sel}</b>: "
+                    f"<b>{n_city_leyenda:,}</b> contratos"
+                )
             fig_dep.update_layout(
-                margin=dict(l=0, r=0, t=36, b=0),
+                margin=dict(l=0, r=0, t=36, b=88),
                 height=520,
                 title=(
                     f"2. {dept_sel}"
                     + (f" → **{ciudad_sel}**" if ciudad_sel else "")
                 ),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+                annotations=[
+                    dict(
+                        text="<br>".join(leyenda_parts),
+                        xref="paper",
+                        yref="paper",
+                        x=0,
+                        y=-0.04,
+                        xanchor="left",
+                        yanchor="top",
+                        align="left",
+                        showarrow=False,
+                        font=dict(size=12),
+                    )
+                ],
             )
             fig_dep.update_geos(
                 fitbounds="locations",
@@ -257,15 +293,51 @@ if geo is not None and norm_map:
             )
             st.dataframe(pd.DataFrame({"Departamento (export)": sin_match}), hide_index=True)
 
-st.subheader("Ranking (barras)")
-fig_bar = px.bar(
-    df.head(40),
-    x="n_contratos",
-    y="departamento",
-    orientation="h",
-    labels={"n_contratos": "N° contratos", "departamento": "Departamento"},
+st.subheader("Ranking")
+df_rank = df.head(40).copy()
+df_rank["departamento_rank"] = (
+    df_rank["departamento"].fillna("").astype(str).str.strip().map(_dept_label_ranking)
 )
-fig_bar.update_layout(yaxis={"categoryorder": "total ascending"})
+fig_bar = px.bar(
+    df_rank,
+    x="n_contratos",
+    y="departamento_rank",
+    orientation="h",
+    labels={"n_contratos": "N° contratos", "departamento_rank": "Departamento"},
+    custom_data=["departamento"],
+)
+fig_bar.update_traces(
+    hovertemplate=(
+        "<b>%{customdata[0]}</b><br>"
+        "N° contratos: %{x:,.0f}<extra></extra>"
+    ),
+)
+fig_bar.update_layout(
+    yaxis={
+        "categoryorder": "total ascending",
+        "automargin": True,
+        "tickfont": {"size": 11},
+        "side": "left",
+    },
+    # Margen izquierdo amplio: si es muy pequeño, Plotly recorta las etiquetas hasta un zoom/relayout.
+    margin={
+        "l": max(200, 8 + 7 * int(df_rank["departamento_rank"].str.len().max() or 10)),
+        "r": 20,
+        "t": 36,
+        "b": 52,
+    },
+    height=max(420, 15 * len(df_rank)),
+)
+max_rank = int(df_rank["n_contratos"].max())
+x_cap = 150_000 if max_rank <= 150_000 else int(((max_rank + 9_999) // 10_000) * 10_000)
+tick_x = list(range(0, x_cap + 1, 10_000))
+fig_bar.update_xaxes(
+    range=[0, x_cap],
+    tickmode="array",
+    tickvals=tick_x,
+    tickformat=",.0f",
+    title="N° contratos",
+)
 st.plotly_chart(fig_bar, use_container_width=True)
 
 csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
@@ -274,10 +346,4 @@ st.download_button(
     data=csv_bytes,
     file_name=f"contratos_por_departamento_{year}.csv",
     mime="text/csv",
-)
-
-st.info(
-    f"**Sin red:** departamentos → `{_LOCAL_GEO.as_posix()}`; "
-    f"municipios (~3 MB) → `{_LOCAL_MPIO.as_posix()}` "
-    f"(DANE `MPIO_CNMBR` / `DPTO_CNMBR`)."
 )
