@@ -83,6 +83,59 @@ def count_contracts_filtered(
     return int(n)
 
 
+def count_scatter_eligible_contracts(
+    csv_path: Path,
+    departamento: str,
+    ciudad: str | None,
+    year: int,
+) -> int:
+    """
+    Contratos del filtro con valor numérico > 0 y duración (días) > 0,
+    mismos criterios que la nube de dispersión en analítica (sin LIMIT).
+    """
+    path = str(csv_path.resolve())
+    con = duckdb.connect(database=":memory:")
+    valor_expr = """try_cast(
+      replace(replace(replace(trim(cast(t."Valor del Contrato" AS VARCHAR)), '$', ''), ',', ''), ' ', '')
+      AS DOUBLE
+    )"""
+    dur_expr = """CASE
+      WHEN t."Fecha de Inicio del Contrato" IS NOT NULL
+       AND t."Fecha de Fin del Contrato" IS NOT NULL
+      THEN date_diff('day', t."Fecha de Inicio del Contrato", t."Fecha de Fin del Contrato")
+      ELSE NULL
+    END"""
+
+    if ciudad:
+        sql = f"""
+        WITH prep AS (
+          SELECT {valor_expr} AS valor_num, {dur_expr} AS duracion_dias
+          FROM {_csv_read_expr()}
+          WHERE t."Departamento" = ?
+            AND t."Ciudad" = ?
+            AND year(t."Fecha de Inicio del Contrato") = ?
+        )
+        SELECT count(*)::BIGINT FROM prep
+        WHERE duracion_dias IS NOT NULL AND duracion_dias > 0
+          AND valor_num IS NOT NULL AND valor_num > 0
+        """
+        row = con.execute(sql, [path, departamento, ciudad, year]).fetchone()
+    else:
+        sql = f"""
+        WITH prep AS (
+          SELECT {valor_expr} AS valor_num, {dur_expr} AS duracion_dias
+          FROM {_csv_read_expr()}
+          WHERE t."Departamento" = ?
+            AND year(t."Fecha de Inicio del Contrato") = ?
+        )
+        SELECT count(*)::BIGINT FROM prep
+        WHERE duracion_dias IS NOT NULL AND duracion_dias > 0
+          AND valor_num IS NOT NULL AND valor_num > 0
+        """
+        row = con.execute(sql, [path, departamento, year]).fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
 def fetch_contracts_page_df(
     csv_path: Path,
     departamento: str,
