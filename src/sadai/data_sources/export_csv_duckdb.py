@@ -54,6 +54,31 @@ def fecha_inicio_anos_rango(
     return (y0, y1)
 
 
+def contratos_por_ciudad_en_departamento_df(
+    csv_path: Path,
+    departamento: str,
+    year: int,
+) -> pd.DataFrame:
+    """
+    Contratos por ciudad (campo Ciudad del export) dentro de un departamento y año de inicio.
+    """
+    path = str(csv_path.resolve())
+    con = duckdb.connect(database=":memory:")
+    sql = f"""
+    SELECT
+      trim(cast(t."Ciudad" AS VARCHAR)) AS ciudad,
+      count(*)::BIGINT AS n_contratos
+    FROM {_csv_read_expr()}
+    WHERE t."Departamento" = ?
+      AND year(t."Fecha de Inicio del Contrato") = ?
+      AND t."Ciudad" IS NOT NULL
+      AND trim(cast(t."Ciudad" AS VARCHAR)) <> ''
+    GROUP BY 1
+    ORDER BY n_contratos DESC
+    """
+    return con.execute(sql, [path, departamento, year]).df()
+
+
 def count_contracts_filtered(
     csv_path: Path,
     departamento: str,
