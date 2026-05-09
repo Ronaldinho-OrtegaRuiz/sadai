@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 from common_setup import EXPORT_CSV, init_app
@@ -56,6 +57,15 @@ def _fmt_cop_tick(t: float) -> str:
         s = f"{t / 1e3:g}".rstrip("0").rstrip(".")
         return f"{s} k"
     return f"{t:g}"
+
+
+def _mediana_valor_y_axis_ticks(y_max: float) -> tuple[list[float], list[str]]:
+    """Marcas eje Y para mediana en COP: usa MM/M/k como _fmt_cop_tick (evita 'B' de Plotly)."""
+    if not np.isfinite(y_max) or y_max <= 0:
+        return [0.0], ["0"]
+    hi = float(y_max * 1.08)
+    vals = np.linspace(0.0, hi, num=7)
+    return vals.tolist(), [_fmt_cop_tick(float(v)) for v in vals]
 
 
 def _fmt_cop_hover(v: object) -> str:
@@ -264,11 +274,98 @@ else:
         hi = sc2["costo_por_dia"].quantile(0.99)
         sc2 = sc2[sc2["costo_por_dia"] <= hi]
     if not sc2.empty:
-        fig_cd = px.histogram(sc2, x="costo_por_dia", nbins=40, labels={"costo_por_dia": "Costo por día"})
-        fig_cd.update_layout(height=_CHART_H, margin=dict(t=40, b=48, l=56, r=24))
-        st.plotly_chart(fig_cd, use_container_width=True)
+        sc_h = sc2[pd.to_numeric(sc2["costo_por_dia"], errors="coerce") > 0].copy()
+        if sc_h.empty:
+            st.info("Sin valores positivos de costo por día para graficar.")
+        else:
+            _nb = 48
+            vals = pd.to_numeric(sc_h["costo_por_dia"], errors="coerce").dropna().to_numpy(dtype=float)
+            counts, edges = np.histogram(vals, bins=_nb)
+            centers = (edges[:-1] + edges[1:]) / 2.0
+            bw = float(edges[1] - edges[0])
+            df_b = pd.DataFrame(
+                {
+                    "centro_costo": centers,
+                    "n": counts.astype(int),
+                    "lo": edges[:-1],
+                    "hi": edges[1:],
+                }
+            )
+            def _hover_costo_bin(lo: float, hi: float, n: int) -> str:
+                return (
+                    f"Rango: {lo:,.0f} \u2013 {hi:,.0f} COP<br>"
+                    f"Cantidad: {int(n):,}"
+                )
 
-st.subheader("Contratos por modalidad (top) y mediana de valor")
+            # Numerito arriba (solo si n < 50); el detalle completo va en hovertext (barra o número).
+            df_b["texto"] = df_b["n"].apply(lambda c: f"{int(c):,}" if 0 < c < 50 else "")
+            hover_texts = [
+                _hover_costo_bin(float(lo), float(hi), int(n))
+                for lo, hi, n in zip(df_b["lo"], df_b["hi"], df_b["n"])
+            ]
+            fig_cd = px.bar(
+                df_b,
+                x="centro_costo",
+                y="n",
+                text="texto",
+                labels={"centro_costo": "Costo por día (COP)", "n": "Cantidad"},
+            )
+            fig_cd.update_traces(
+                width=bw * 0.92,
+                textposition="outside",
+                texttemplate="%{text}",
+                cliponaxis=False,
+                hovertext=hover_texts,
+                hovertemplate="%{hovertext}<extra></extra>",
+                hoverinfo="text",
+            )
+            # Plotly no suele capturar hover sobre el texto externo: puntos casi invisibles
+            # encima de la barra (solo n<50) con el mismo tooltip.
+            m_hit = (df_b["n"] > 0) & (df_b["n"] < 50)
+            if m_hit.any():
+                sub = df_b.loc[m_hit]
+                ymax = float(df_b["n"].max()) or 1.0
+                n_sub = sub["n"].to_numpy(dtype=float)
+                y_hit = n_sub + np.maximum(n_sub * 0.2, ymax * 0.04)
+                ht_sub = [
+                    _hover_costo_bin(float(lo), float(hi), int(n))
+                    for lo, hi, n in zip(sub["lo"], sub["hi"], sub["n"])
+                ]
+                fig_cd.add_trace(
+                    go.Scatter(
+                        x=sub["centro_costo"].to_numpy(),
+                        y=y_hit,
+                        mode="markers",
+                        marker=dict(
+                            size=40,
+                            color="rgba(255,255,255,0.004)",
+                            line=dict(width=0),
+                        ),
+                        hovertext=ht_sub,
+                        hovertemplate="%{hovertext}<extra></extra>",
+                        hoverinfo="text",
+                        showlegend=False,
+                        name="",
+                    )
+                )
+            fig_cd.update_layout(
+                bargap=0.06,
+                height=_CHART_H,
+                margin=dict(t=64, b=56, l=56, r=24),
+            )
+            fig_cd.update_xaxes(
+                title="Costo por día (COP)",
+                showgrid=True,
+                tickformat=",.0f",
+            )
+            fig_cd.update_yaxes(
+                title_text="Cantidad",
+                tickformat=",.0f",
+                rangemode="tozero",
+            )
+            st.plotly_chart(fig_cd, use_container_width=True)
+
+st.subheader("Contratos por modalidad y mediana de valor")
 if mod.empty:
     st.info("Sin datos agregados por modalidad.")
 else:
@@ -287,16 +384,49 @@ else:
     )
     st.plotly_chart(fig_m, use_container_width=True)
 
+    mod_med = mod.dropna(subset=["mediana_valor"]).copy()
+    mod_med["_hov_mediana"] = mod_med["mediana_valor"].map(_fmt_cop_hover)
+    _tv, _tt = _mediana_valor_y_axis_ticks(float(mod_med["mediana_valor"].max()))
+    # Primer “escalón” del eje Y: entre 0 y la primera marca > 0; si la mediana cae ahí, número arriba.
+    _thr: float | None
+    if len(_tv) >= 2 and float(_tv[1]) > 0:
+        _thr = float(_tv[1])
+    else:
+        _thr = None
+
+    def _texto_mediana_arriba(v: object) -> str:
+        if _thr is None:
+            return ""
+        if v is None or (isinstance(v, float) and not np.isfinite(v)):
+            return ""
+        try:
+            x = float(v)
+        except (TypeError, ValueError):
+            return ""
+        if x <= 0 or x >= _thr:
+            return ""
+        return _fmt_cop_hover(x)
+
+    mod_med["texto_mediana"] = mod_med["mediana_valor"].map(_texto_mediana_arriba)
     fig_m2 = px.bar(
-        mod.dropna(subset=["mediana_valor"]),
+        mod_med,
         x="modalidad_g",
         y="mediana_valor",
+        text="texto_mediana",
         labels={"modalidad_g": "Modalidad", "mediana_valor": "Mediana valor"},
+        custom_data=["_hov_mediana"],
     )
+    fig_m2.update_traces(
+        hovertemplate="<b>%{x}</b><br>Mediana: %{customdata[0]}<extra></extra>",
+        textposition="outside",
+        texttemplate="%{text}",
+        cliponaxis=False,
+    )
+    fig_m2.update_yaxes(tickmode="array", tickvals=_tv, ticktext=_tt)
     fig_m2.update_layout(
         xaxis_tickangle=-35,
         height=_CHART_H,
-        margin=dict(t=48, b=120, l=56, r=24),
+        margin=dict(t=72, b=120, l=56, r=24),
     )
     st.plotly_chart(fig_m2, use_container_width=True)
 
