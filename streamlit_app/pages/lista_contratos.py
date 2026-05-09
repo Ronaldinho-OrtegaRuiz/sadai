@@ -52,10 +52,6 @@ def _cached_page(
 st.set_page_config(page_title="Lista de Contratos — SADAI", layout="wide")
 
 st.title("Contratos SECOP II (export local)")
-st.caption(
-    "Departamentos y ciudades: **solo API** datos.gov.co. "
-    "Contratos: `export.csv` con DuckDB (cada conteo o página puede tardar si el CSV es muy grande)."
-)
 
 if not EXPORT_CSV.is_file():
     st.error(f"No se encontró `{EXPORT_CSV.name}` en la raíz del proyecto.")
@@ -175,15 +171,4 @@ else:
         use_container_width=True,
         height=480,
         hide_index=True,
-    )
-
-with st.expander("Filtro aplicado (DuckDB)"):
-    city_sql = "cualquier ciudad" if not ciudad_token else repr(ciudad_token)
-    st.code(
-        f'FROM export.csv\nWHERE "Departamento" = {dept!r}\n'
-        f'  AND ciudad: {city_sql}\n'
-        f'  AND year("Fecha de Inicio del Contrato") = {year}\n'
-        f"ORDER BY \"ID Contrato\" ASC\n"
-        f"LIMIT {page_size} OFFSET {page * page_size}",
-        language="text",
     )

@@ -30,8 +30,7 @@ from sadai.data_sources.export_csv_duckdb import (  # noqa: E402
 st.set_page_config(page_title="Indicadores y patrones — SADAI", layout="wide")
 st.title("Indicadores y patrones")
 st.caption(
-    "Métricas derivadas (costo por día, concentración) y vistas estadísticas sobre el mismo filtro regional. "
-    "**Antigüedad del contratista** no está implementada (requiere datos externos enlazados por NIT)."
+    "Métricas derivadas (costo por día, concentración) y vistas estadísticas sobre el mismo filtro regional."
 )
 
 if not EXPORT_CSV.is_file():
@@ -174,31 +173,36 @@ n_dispersion_eligible = _scatter_eligible_n(csv_s, dept, ciudad, year)
 m1, m2 = st.columns(2)
 m1.metric("Contratos en el filtro (año y región)", f"{n_total_filtro:,}")
 m2.metric(
-    "Con valor y duración > 0 (elegibles para la nube)",
+    "Con valor y duración > 0",
     f"{n_dispersion_eligible:,}",
     help="Solo estos cumplen las condiciones del gráfico de dispersión; el total del filtro puede ser mayor.",
 )
 
-# Tope del slider: todos los elegibles o 20k si hay más (rendimiento en el navegador).
-_cap_disp = max(0, min(n_dispersion_eligible, 20_000))
+# Tope del slider = todos los que cumplen valor y duración > 0 (sin límite artificial).
+_cap_disp = max(0, n_dispersion_eligible)
 if _cap_disp == 0:
     n_muestra = 0
     st.warning(
-        "No hay contratos elegibles para la dispersión en este filtro "
-        "(hace falta **valor** y **duración** en días ambos > 0)."
+        "No hay contratos con **valor** y **duración** (días) ambos > 0 para la dispersión en este filtro."
     )
 else:
     _default = min(2_500, _cap_disp)
     _min_sl = min(100, _cap_disp) if _cap_disp >= 100 else 1
-    _step = 50 if _cap_disp >= 500 else max(1, _cap_disp // 50 or 1)
+    # Rangos muy grandes: step fino evita que (max-min) no sea múltiplo del paso en Streamlit.
+    if _cap_disp > 50_000:
+        _step = 1
+    elif _cap_disp >= 500:
+        _step = 50
+    else:
+        _step = max(1, _cap_disp // 50 or 1)
     n_muestra = st.slider(
-        "Puntos mostrados en la nube de dispersión",
+        "Puntos mostrados en la dispersión",
         min_value=_min_sl,
         max_value=_cap_disp,
         value=min(_default, _cap_disp),
         step=_step,
         help=(
-            f"Hasta {_cap_disp:,} puntos (de {n_dispersion_eligible:,} elegibles). "
+            f"Hasta {_cap_disp:,} puntos (todos los que cumplen valor y duración > 0). "
             f"Total en el filtro: {n_total_filtro:,} contratos."
         ),
     )
@@ -213,16 +217,10 @@ st.subheader("Valor del contrato vs duración (días)")
 if sc.empty:
     st.info("No hay filas con valor y duración positivos para graficar en este filtro.")
 else:
-    if n_dispersion_eligible > 20_000:
-        st.caption(
-            f"**{len(sc):,}** puntos en el gráfico (tope de **20.000** por rendimiento; "
-            f"**{n_dispersion_eligible:,}** elegibles; **{n_total_filtro:,}** contratos en el filtro)."
-        )
-    else:
-        st.caption(
-            f"**{len(sc):,}** puntos en el gráfico (**{n_dispersion_eligible:,}** elegibles; "
-            f"**{n_total_filtro:,}** contratos totales en el filtro)."
-        )
+    st.caption(
+        f"**{len(sc):,}** puntos en el gráfico (**{n_dispersion_eligible:,}** con valor y duración > 0; "
+        f"**{n_total_filtro:,}** contratos en el filtro)."
+    )
     sc_plot = sc.copy()
     sc_plot["_hv_valor"] = sc_plot["valor_num"].map(_fmt_cop_hover)
     fig_sc = px.scatter(

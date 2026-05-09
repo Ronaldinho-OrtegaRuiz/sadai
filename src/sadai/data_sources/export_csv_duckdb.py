@@ -116,7 +116,7 @@ def count_scatter_eligible_contracts(
 ) -> int:
     """
     Contratos del filtro con valor numérico > 0 y duración (días) > 0,
-    mismos criterios que la nube de dispersión en analítica (sin LIMIT).
+    mismos criterios que el gráfico de dispersión en analítica (sin LIMIT).
     """
     path = str(csv_path.resolve())
     con = duckdb.connect(database=":memory:")

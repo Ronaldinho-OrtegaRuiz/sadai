@@ -33,6 +33,30 @@ from sadai.geo.colombia_municipios import (  # noqa: E402
 )
 from sadai.data_sources.export_csv_duckdb import count_contracts_filtered  # noqa: E402
 
+# Mapa Colombia + ranking: escala oficial Plotly (sin tocar).
+_COLORSCALE_NACIONAL = px.colors.sequential.Magenta
+
+# Municipios (mapa depto): mismos matices que Colombia pero **opacos** y opacidad 1 en el trace,
+# para que 0 contratos se vea blanco/rosado y no “gris” (antes: rgba + opacity < 1).
+_MAG_SEQ = px.colors.sequential.Magenta
+_COLORSCALE_MPIO = [
+    [0.0, "#fffafb"],
+    [0.1, "#fef2f4"],
+    [0.28, _MAG_SEQ[0]],
+    [0.5, _MAG_SEQ[2]],
+    [0.72, _MAG_SEQ[4]],
+    [1.0, _MAG_SEQ[-1]],
+]
+
+_COLORSCALE_DEPTO_FALLBACK = [[0.0, "#fffafb"], [1.0, _MAG_SEQ[-1]]]
+
+# Ciudad seleccionada: fucsia más vivo que el fondo; pico = mismo que el mapa nacional.
+_COLORSCALE_CIUDAD_ACTIVA = [
+    [0.0, "#d946ef"],
+    [1.0, _MAG_SEQ[-1]],
+]
+_COLOR_CIUDAD_ACTIVA_BORDE = "#6c2167"
+
 st.set_page_config(page_title="Mapa territorial — SADAI", layout="wide")
 st.title("Mapa territorial")
 
@@ -272,7 +296,7 @@ if geo is not None and norm_map:
         locations="dpto",
         color="n",
         featureidkey="properties.DPTO_CNMBR",
-        color_continuous_scale="Blues",
+        color_continuous_scale=_COLORSCALE_NACIONAL,
         labels={"dpto": "Departamento", "n": "Contratos"},
     )
     fig_map.update_traces(marker_line_width=0.4, marker_line_color="white")
@@ -371,10 +395,7 @@ if geo is not None and norm_map:
                             locations=locs,
                             z=zs,
                             featureidkey="properties.MPIO_CNMBR",
-                            colorscale=[
-                                [0.0, "rgba(220, 235, 255, 0.38)"],
-                                [1.0, "rgba(25, 70, 150, 0.58)"],
-                            ],
+                            colorscale=_COLORSCALE_MPIO,
                             zmin=0,
                             zmax=max(max(zs), 1.0) if zs else 1.0,
                             showscale=True,
@@ -385,8 +406,8 @@ if geo is not None and norm_map:
                                 thickness=12,
                             ),
                             marker=dict(
-                                line=dict(width=0.35, color="rgba(255,255,255,0.85)"),
-                                opacity=0.78,
+                                line=dict(width=0.35, color="rgba(255,255,255,0.9)"),
+                                opacity=1.0,
                             ),
                             customdata=customdata,
                             hovertemplate=(
@@ -425,9 +446,10 @@ if geo is not None and norm_map:
                                     locations=[mk],
                                     z=[max(n_hi, 1)],
                                     featureidkey="properties.MPIO_CNMBR",
-                                    colorscale=[[0, "#ffe0b2"], [1, "#ef6c00"]],
+                                    colorscale=_COLORSCALE_CIUDAD_ACTIVA,
                                     marker_line_width=2.6,
-                                    marker_line_color="#bf360c",
+                                    marker_line_color=_COLOR_CIUDAD_ACTIVA_BORDE,
+                                    marker=dict(opacity=1.0),
                                     showscale=False,
                                     name="Ciudad activa",
                                     hovertemplate=(
@@ -455,9 +477,10 @@ if geo is not None and norm_map:
                         locations=[geo_key_sel],
                         z=[max(n_dep, 1)],
                         featureidkey="properties.DPTO_CNMBR",
-                        colorscale=[[0, "#c8e6c9"], [1, "#43a047"]],
+                        colorscale=_COLORSCALE_DEPTO_FALLBACK,
                         marker_line_width=1.2,
-                        marker_line_color="#1b5e20",
+                        marker_line_color="#6c2167",
+                        marker=dict(opacity=1.0),
                         showscale=False,
                         name="Departamento",
                         hovertemplate=(
@@ -470,12 +493,12 @@ if geo is not None and norm_map:
                 chart_key_depto = None
 
             leyenda_parts = [
-                f"<span style='color:#1565c0'>■</span> Municipios (año {year}): volumen por ciudad SECOP",
-                f"<span style='color:#2e7d32'>●</span> Total departamento: <b>{n_dep:,}</b> contratos",
+                f"<span style='color:#e879f9'>■</span> Municipios (año {year}): volumen por ciudad SECOP",
+                f"<span style='color:#6c2167'>●</span> Total departamento: <b>{n_dep:,}</b> contratos",
             ]
             if n_city_leyenda is not None and ciudad_sel:
                 leyenda_parts.append(
-                    f"<span style='color:#e65100'>■</span> Ciudad activa <b>{ciudad_sel}</b>: "
+                    f"<span style='color:#d946ef'>■</span> Ciudad activa <b>{ciudad_sel}</b>: "
                     f"<b>{n_city_leyenda:,}</b> contratos"
                 )
             leyenda_parts.append(
@@ -553,6 +576,8 @@ fig_bar = px.bar(
     x="n_contratos",
     y="departamento_rank",
     orientation="h",
+    color="n_contratos",
+    color_continuous_scale=_COLORSCALE_NACIONAL,
     labels={"n_contratos": "N° contratos", "departamento_rank": "Departamento"},
     custom_data=["departamento"],
 )
@@ -563,6 +588,7 @@ fig_bar.update_traces(
     ),
 )
 fig_bar.update_layout(
+    coloraxis_showscale=False,
     yaxis={
         "categoryorder": "total ascending",
         "automargin": True,
