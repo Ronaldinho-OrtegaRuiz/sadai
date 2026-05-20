@@ -43,7 +43,7 @@ mapa = st.Page(
 )
 anomalias = st.Page(
     "pages/deteccion_anomalias.py",
-    title="Detección de anomalías",
+    title="Priorización de riesgo",
 )
 nav = st.navigation([lista, reglas, exploracion, mapa, anomalias])
 nav.run()

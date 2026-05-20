@@ -1,9 +1,15 @@
-"""Detección de anomalías (Capa 2): cinco métodos sobre export.csv vía DuckDB + sklearn."""
+"""
+Pipeline híbrido de priorización de riesgo contractual (entidad–proveedor).
+
+Capa 1 — Validación/coherencia (conteos; descarte antes de agregar).
+Capa 2 — Reglas de riesgo interpretables (score_reglas ∈ [0, 1]).
+Capa 3 — Isolation Forest sobre agregados relacionales.
+Salida — score_final = combinación ponderada + ranking explicable.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from enum import Enum
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -17,33 +23,28 @@ from sadai.analytics.analitica_local import _params_base, _prep_columns_sql, _wh
 
 _READ = "read_csv_auto(?, header=true, max_line_size=2000000, ignore_errors=true)"
 
-AUTO_FULL_THRESHOLD = 80_000
-DEFAULT_SAMPLE_SIZE = 50_000
 DEFAULT_SEED = 42
 DEFAULT_CONTAMINATION = 0.05
-DEFAULT_MIN_ENTITY = 30
-DEFAULT_WINDOW_DAYS = 30
+DEFAULT_BURST_WINDOW_DAYS = 10
+DEFAULT_BURST_MIN_CONTRACTS = 3
+DEFAULT_WEIGHT_RULES = 0.40
+DEFAULT_WEIGHT_IF = 0.60
+MIN_PAIR_CONTRACTS = 2
 
-
-class DetectionMethod(str, Enum):
-    GLOBAL_IF = "p1_global_if"
-    HYBRID = "p2_hybrid"
-    PER_ENTITY = "p3_per_entity"
-    AGGREGATE_PAIR = "p4_aggregate_pair"
-    TEXT_NUMERIC = "p5_text_numeric"
-
-
-METHOD_LABELS: dict[DetectionMethod, str] = {
-    DetectionMethod.GLOBAL_IF: "1 — Isolation Forest global (contrato)",
-    DetectionMethod.HYBRID: "2 — Híbrido (reglas + IF)",
-    DetectionMethod.PER_ENTITY: "3 — IF por entidad (fallback global)",
-    DetectionMethod.AGGREGATE_PAIR: "4 — Agregado entidad–proveedor (ventana)",
-    DetectionMethod.TEXT_NUMERIC: "5 — Numérico + perfil de objeto",
+# Pesos interpretables (Capa 2) — suma máxima teórica 0.85; se capa en 1.0
+RULE_WEIGHTS: dict[str, tuple[float, str]] = {
+    "contratacion_directa": (0.15, "Ratio contratación directa ≥ 50 %"),
+    "frecuencia_temporal": (0.25, f"≥ {DEFAULT_BURST_MIN_CONTRACTS} contratos en ventana corta"),
+    "proveedor_dominante": (0.20, "Concentración del proveedor en la entidad ≥ 25 %"),
+    "objeto_generico": (0.10, "≥ 50 % de contratos con objeto muy corto (< 30 car.)"),
+    "costo_dia_extremo": (0.15, "Costo/día promedio en percentil 90+ del cohorte"),
 }
 
 
 @dataclass(frozen=True)
-class DetectionCounts:
+class PipelineCounts:
+    """Capa 1: contratos en el filtro."""
+
     total: int
     n_discarded: int
     n_analyzed: int
@@ -54,20 +55,17 @@ class DetectionCounts:
 
 
 @dataclass
-class DetectionResult:
-    method: DetectionMethod
-    counts: DetectionCounts
-    n_scored: int
+class HybridPipelineResult:
+    counts: PipelineCounts
+    n_pairs: int
+    n_pairs_scored: int
     n_alerts: int
-    used_sample: bool
-    sample_size_requested: int | None
     ranking: pd.DataFrame
-    discard_motives: pd.DataFrame | None = None
-    meta: dict[str, Any] | None = None
+    rule_catalog: pd.DataFrame = field(default_factory=pd.DataFrame)
+    meta: dict[str, Any] = field(default_factory=dict)
 
 
 def _discard_sql_extra() -> str:
-    """Condiciones que excluyen un contrato del scoring ML (además de flags de calidad)."""
     return """
     (flag_valor_invalido = 1)
     OR (flag_fin_antes_inicio = 1)
@@ -77,12 +75,12 @@ def _discard_sql_extra() -> str:
     """
 
 
-def detection_population_counts(
+def pipeline_population_counts(
     csv_path: Path,
     departamento: str,
     ciudad: str | None,
     year: int,
-) -> DetectionCounts:
+) -> PipelineCounts:
     path = str(csv_path.resolve())
     w = _where_region_anio(ciudad)
     cols = _prep_columns_sql()
@@ -106,10 +104,10 @@ def detection_population_counts(
     con = duckdb.connect(database=":memory:")
     row = con.execute(sql, _params_base(path, departamento, ciudad, year)).fetchone()
     if not row:
-        return DetectionCounts(0, 0, 0, 0, 0, 0, 0)
+        return PipelineCounts(0, 0, 0, 0, 0, 0, 0)
     total = int(row[0] or 0)
     n_disc = int(row[1] or 0)
-    return DetectionCounts(
+    return PipelineCounts(
         total=total,
         n_discarded=n_disc,
         n_analyzed=max(0, total - n_disc),
@@ -120,167 +118,109 @@ def detection_population_counts(
     )
 
 
-def fetch_analyzable_contracts_df(
+def fetch_pair_aggregates_df(
     csv_path: Path,
     departamento: str,
     ciudad: str | None,
     year: int,
     *,
-    limit: int | None,
-    seed: int = DEFAULT_SEED,
+    burst_window_days: int = DEFAULT_BURST_WINDOW_DAYS,
 ) -> pd.DataFrame:
-    """Contratos elegibles para ML (sin descartados), opcionalmente muestreados."""
+    """Agregación entidad–proveedor sobre contratos que pasan Capa 1."""
     path = str(csv_path.resolve())
     w = _where_region_anio(ciudad)
     cols = _prep_columns_sql()
     discard = _discard_sql_extra()
-    sector_expr = 'trim(coalesce(cast(t."Sector" AS VARCHAR), \'\'))'
+    bw = max(1, int(burst_window_days))
     sql = f"""
     WITH prep AS (
       SELECT
         {cols},
-        {sector_expr} AS sector,
-        valor_num / NULLIF(duracion_dias, 0) AS costo_por_dia
+        t."Objeto del Contrato" AS objeto_raw,
+        valor_num / NULLIF(duracion_dias, 0) AS costo_por_dia,
+        CASE
+          WHEN lower(coalesce(modalidad, '')) LIKE '%direct%'
+            OR lower(coalesce(modalidad, '')) LIKE '%directa%' THEN 1 ELSE 0
+        END AS es_directa
       FROM {_READ} t
       WHERE {w}
         AND NOT ({discard})
-    )
-    SELECT * FROM prep
-    ORDER BY hash(CAST(id_contrato AS VARCHAR) || ?)
-    """
-    params: list[Any] = _params_base(path, departamento, ciudad, year) + [str(seed)]
-    if limit is not None and limit > 0:
-        sql += "\n    LIMIT ?"
-        params.append(int(limit))
-    con = duckdb.connect(database=":memory:")
-    return con.execute(sql, params).df()
-
-
-def fetch_aggregate_pairs_df(
-    csv_path: Path,
-    departamento: str,
-    ciudad: str | None,
-    year: int,
-    *,
-    window_days: int = DEFAULT_WINDOW_DAYS,
-) -> pd.DataFrame:
-    """Pares entidad–proveedor con ≥2 contratos en ventana rolling (días) o en el año."""
-    path = str(csv_path.resolve())
-    w = _where_region_anio(ciudad)
-    wd = max(1, int(window_days))
-    sql = f"""
-    WITH base AS (
-      SELECT
-        t."Nit Entidad" AS nit_e,
-        t."Nombre Entidad" AS nombre_e,
-        t."Documento Proveedor" AS doc_p,
-        t."Proveedor Adjudicado" AS nombre_p,
-        t."Modalidad de Contratacion" AS modalidad,
-        t."Fecha de Inicio del Contrato" AS fecha_inicio,
-        try_cast(
-          replace(replace(replace(trim(cast(t."Valor del Contrato" AS VARCHAR)), '$', ''), ',', ''), ' ', '')
-          AS DOUBLE
-        ) AS valor_num
-      FROM {_READ} t
-      WHERE {w}
-        AND t."Nit Entidad" IS NOT NULL AND trim(cast(t."Nit Entidad" AS VARCHAR)) <> ''
-        AND t."Documento Proveedor" IS NOT NULL
-        AND trim(cast(t."Documento Proveedor" AS VARCHAR)) <> ''
-        AND valor_num IS NOT NULL AND valor_num > 0
-        AND t."Fecha de Inicio del Contrato" IS NOT NULL
     ),
-    pares AS (
+    ent_tot AS (
+      SELECT nit_entidad AS nit_e, count(*)::BIGINT AS n_entidad_anio
+      FROM prep
+      GROUP BY 1
+    ),
+    burst AS (
+      SELECT nit_entidad AS nit_e, doc_proveedor AS doc_p,
+        max(n_win)::BIGINT AS max_contratos_ventana
+      FROM (
+        SELECT
+          nit_entidad,
+          doc_proveedor,
+          fecha_inicio,
+          count(*) OVER (
+            PARTITION BY nit_entidad, doc_proveedor
+            ORDER BY fecha_inicio
+            RANGE BETWEEN INTERVAL '{bw}' DAY PRECEDING AND CURRENT ROW
+          )::BIGINT AS n_win
+        FROM prep
+        WHERE fecha_inicio IS NOT NULL
+      ) x
+      GROUP BY 1, 2
+    ),
+    par AS (
       SELECT
-        a.nit_e,
-        a.nombre_e,
-        a.doc_p,
-        a.nombre_p,
-        count(DISTINCT b.fecha_inicio)::BIGINT AS n_contratos_ventana,
-        sum(b.valor_num) AS sum_valor_ventana,
-        avg(b.valor_num) AS avg_valor_ventana,
-        sum(
-          CASE WHEN lower(coalesce(b.modalidad, '')) LIKE '%direct%'
-            OR lower(coalesce(b.modalidad, '')) LIKE '%directa%' THEN 1 ELSE 0 END
-        )::DOUBLE AS n_directa_ventana
-      FROM base a
-      JOIN base b
-        ON a.nit_e = b.nit_e AND a.doc_p = b.doc_p
-       AND b.fecha_inicio BETWEEN a.fecha_inicio - INTERVAL '{wd}' DAY AND a.fecha_inicio
+        nit_entidad AS nit_e,
+        nombre_entidad AS nombre_e,
+        doc_proveedor AS doc_p,
+        proveedor AS nombre_p,
+        count(*)::BIGINT AS n_contratos,
+        sum(valor_num) AS suma_valor,
+        avg(valor_num) AS promedio_valor,
+        avg(costo_por_dia) AS costo_dia_promedio,
+        avg(duracion_dias) AS duracion_promedio,
+        avg(es_directa::DOUBLE) AS ratio_directa,
+        avg(CASE WHEN longitud_objeto < 30 THEN 1.0 ELSE 0.0 END) AS pct_objeto_corto,
+        count(DISTINCT left(trim(coalesce(objeto_raw, '')), 50))::BIGINT AS diversidad_objetos,
+        min(longitud_objeto) AS min_longitud_objeto
+      FROM prep
       GROUP BY 1, 2, 3, 4
     )
     SELECT
-      nit_e,
-      nombre_e,
-      doc_p,
-      nombre_p,
-      n_contratos_ventana,
-      sum_valor_ventana,
-      avg_valor_ventana,
-      n_directa_ventana,
-      n_directa_ventana / NULLIF(n_contratos_ventana, 0) AS ratio_directa_ventana
-    FROM pares
-    WHERE n_contratos_ventana >= 2
+      p.nit_e,
+      p.nombre_e,
+      p.doc_p,
+      p.nombre_p,
+      p.n_contratos,
+      p.suma_valor,
+      p.promedio_valor,
+      p.costo_dia_promedio,
+      p.duracion_promedio,
+      p.ratio_directa,
+      p.pct_objeto_corto,
+      p.diversidad_objetos,
+      p.min_longitud_objeto,
+      coalesce(b.max_contratos_ventana, p.n_contratos) AS max_contratos_ventana,
+      (p.n_contratos * 1.0 / NULLIF(e.n_entidad_anio, 0)) AS concentracion_entidad,
+      e.n_entidad_anio
+    FROM par p
+    JOIN ent_tot e ON p.nit_e = e.nit_e
+    LEFT JOIN burst b ON p.nit_e = b.nit_e AND p.doc_p = b.doc_p
   """
     con = duckdb.connect(database=":memory:")
     return con.execute(sql, _params_base(path, departamento, ciudad, year)).df()
 
 
-def _modalidad_riesgo(modalidad: object) -> float:
-    s = str(modalidad or "").lower()
-    if "licit" in s and ("públic" in s or "publica" in s):
-        return 1.0
-    if "abreviad" in s:
-        return 5.0
-    if "direct" in s:
-        return 10.0
-    if "menor cuant" in s or "mínima cuant" in s or "minima cuant" in s:
-        return 6.0
-    return 7.0
+def _is_directa_threshold(ratio: float) -> bool:
+    return float(ratio) >= 0.5
 
 
-def _enrich_features(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    out["log_valor"] = np.log1p(out["valor_num"].astype(float))
-    out["log_duracion"] = np.log1p(out["duracion_dias"].astype(float))
-    out["log_costo_dia"] = np.log1p(out["costo_por_dia"].astype(float).clip(lower=0))
-    out["puntuacion_modalidad"] = out["modalidad"].map(_modalidad_riesgo)
-    out["longitud_objeto"] = out["longitud_objeto"].fillna(0).astype(float)
-    sect = out["sector"].replace("", np.nan)
-    med = out.groupby(sect, dropna=False)["valor_num"].transform("median")
-    out["desviacion_sector"] = (out["valor_num"] - med) / med.replace(0, np.nan)
-    out["desviacion_sector"] = out["desviacion_sector"].replace([np.inf, -np.inf], np.nan).fillna(0)
-    return out
-
-
-def _base_feature_matrix(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
-    cols = [
-        "log_valor",
-        "log_duracion",
-        "log_costo_dia",
-        "puntuacion_modalidad",
-        "longitud_objeto",
-    ]
-    X = df[cols].astype(float).replace([np.inf, -np.inf], np.nan).fillna(0)
-    return X, cols
-
-
-def _text_numeric_matrix(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
-    cols = [
-        "log_valor",
-        "log_duracion",
-        "puntuacion_modalidad",
-        "longitud_objeto",
-        "desviacion_sector",
-    ]
-    X = df[cols].astype(float).replace([np.inf, -np.inf], np.nan).fillna(0)
-    return X, cols
-
-
-def _fit_isolation_scores(
+def _fit_if_scores(
     X: pd.DataFrame,
     *,
-    contamination: float = DEFAULT_CONTAMINATION,
-    seed: int = DEFAULT_SEED,
+    contamination: float,
+    seed: int,
 ) -> np.ndarray:
     if len(X) < 10:
         return np.zeros(len(X), dtype=float)
@@ -293,350 +233,251 @@ def _fit_isolation_scores(
         n_jobs=-1,
     )
     clf.fit(Xs)
-    raw = clf.decision_function(Xs)
-    return (-raw).astype(float)
+    return (-clf.decision_function(Xs)).astype(float)
 
 
-def _rule_component_scores(df: pd.DataFrame) -> pd.Series:
-    z_val = (df["valor_num"] - df["valor_num"].median()) / (df["valor_num"].std() + 1e-9)
-    z_costo = (df["costo_por_dia"] - df["costo_por_dia"].median()) / (df["costo_por_dia"].std() + 1e-9)
-    mod = df["puntuacion_modalidad"] / 10.0
-    obj = (30 - df["longitud_objeto"].clip(upper=30)) / 30.0
-    comp = (
-        z_val.abs().clip(0, 5) / 5 * 0.35
-        + z_costo.abs().clip(0, 5) / 5 * 0.35
-        + mod * 0.2
-        + obj.clip(0, 1) * 0.1
-    )
-    return comp
+def _normalize_01(s: pd.Series) -> pd.Series:
+    lo, hi = float(s.min()), float(s.max())
+    if hi - lo < 1e-12:
+        return pd.Series(0.0, index=s.index)
+    return (s - lo) / (hi - lo)
 
 
-def _explain_row(row: pd.Series, ref: pd.DataFrame, feature_cols: list[str]) -> str:
+def _compute_rule_scores(
+    df: pd.DataFrame,
+    *,
+    burst_min_contracts: int,
+    costo_dia_p90: float,
+) -> tuple[pd.Series, pd.DataFrame]:
+    """Capa 2: score_reglas y matriz de reglas disparadas."""
+    flags = pd.DataFrame(index=df.index)
+    flags["contratacion_directa"] = df["ratio_directa"].map(_is_directa_threshold)
+    flags["frecuencia_temporal"] = df["max_contratos_ventana"] >= burst_min_contracts
+    flags["proveedor_dominante"] = df["concentracion_entidad"] >= 0.25
+    flags["objeto_generico"] = df["pct_objeto_corto"] >= 0.5
+    flags["costo_dia_extremo"] = df["costo_dia_promedio"].fillna(0) >= costo_dia_p90
+
+    score = pd.Series(0.0, index=df.index)
+    for key, (w, _) in RULE_WEIGHTS.items():
+        score = score + flags[key].astype(float) * w
+    score = score.clip(0.0, 1.0)
+
+    active = []
+    for _, row in flags.iterrows():
+        parts = [RULE_WEIGHTS[k][1] for k in RULE_WEIGHTS if row[k]]
+        active.append("; ".join(parts) if parts else "")
+    flags["reglas_disparadas"] = active
+    return score, flags
+
+
+def _if_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
+    """Features para Isolation Forest sobre agregados (Capa 3)."""
+    out = pd.DataFrame(index=df.index)
+    out["log_n_contratos"] = np.log1p(df["n_contratos"].astype(float))
+    out["log_suma_valor"] = np.log1p(df["suma_valor"].astype(float))
+    out["log_promedio_valor"] = np.log1p(df["promedio_valor"].astype(float))
+    out["ratio_directa"] = df["ratio_directa"].astype(float)
+    out["concentracion_entidad"] = df["concentracion_entidad"].astype(float)
+    out["max_contratos_ventana"] = df["max_contratos_ventana"].astype(float)
+    out["costo_dia_promedio"] = np.log1p(df["costo_dia_promedio"].fillna(0).astype(float))
+    out["duracion_promedio"] = np.log1p(df["duracion_promedio"].fillna(0).astype(float))
+    out["diversidad_objetos"] = df["diversidad_objetos"].astype(float)
+    out["pct_objeto_corto"] = df["pct_objeto_corto"].astype(float)
+    repeticion = 1.0 - (df["diversidad_objetos"] / df["n_contratos"].clip(lower=1)).clip(0, 1)
+    out["repeticion_objeto"] = repeticion.astype(float)
+    return out.replace([np.inf, -np.inf], np.nan).fillna(0)
+
+
+def _build_explanation(
+    row: pd.Series,
+    flags_row: pd.Series,
+    score_reglas: float,
+    score_if: float,
+) -> str:
     parts: list[str] = []
-    if row.get("puntuacion_modalidad", 0) >= 8:
-        parts.append("modalidad de alto riesgo")
-    if row.get("longitud_objeto", 99) < 30:
-        parts.append("objeto muy corto")
-    v = float(row.get("costo_por_dia", 0) or 0)
-    if v > 0 and v >= ref["costo_por_dia"].quantile(0.95):
-        parts.append("costo/día en percentil 95+")
-    val = float(row.get("valor_num", 0) or 0)
-    if val >= ref["valor_num"].quantile(0.95):
-        parts.append("valor en percentil 95+")
-    if abs(float(row.get("desviacion_sector", 0) or 0)) >= 1.5:
-        parts.append("desviación alta vs mediana del sector")
+    if flags_row.get("contratacion_directa"):
+        parts.append("alta contratación directa")
+    if flags_row.get("frecuencia_temporal"):
+        parts.append("ráfaga de contratos en ventana corta")
+    if flags_row.get("proveedor_dominante"):
+        parts.append("proveedor dominante en la entidad")
+    if flags_row.get("objeto_generico"):
+        parts.append("objetos contractuales genéricos")
+    if flags_row.get("costo_dia_extremo"):
+        parts.append("costo/día promedio elevado")
+    if score_if >= 0.7:
+        parts.append("patrón agregado atípico (Isolation Forest)")
     if not parts:
-        parts.append("combinación atípica multivariable")
+        parts.append(
+            f"combinación de scores (reglas={score_reglas:.2f}, anomalía={score_if:.2f})"
+        )
     return "; ".join(parts)
 
 
-def _apply_alert_threshold(scores: pd.Series, alert_percentile: float) -> pd.Series:
-    if scores.empty:
-        return pd.Series(dtype=bool)
-    thr = np.percentile(scores, alert_percentile)
-    return scores >= thr
+def rule_catalog_df() -> pd.DataFrame:
+    rows = [
+        {"regla": k, "peso": w, "descripcion": desc}
+        for k, (w, desc) in RULE_WEIGHTS.items()
+    ]
+    return pd.DataFrame(rows)
 
 
-def _resolve_sample_limit(
-    n_analyzed: int,
-    sample_mode: str,
-    sample_size: int,
-) -> tuple[int | None, bool]:
-    if n_analyzed <= 0:
-        return None, False
-    if sample_mode == "completo":
-        return None, False
-    if sample_mode == "muestra":
-        return min(sample_size, n_analyzed), True
-    if n_analyzed <= AUTO_FULL_THRESHOLD:
-        return None, False
-    return min(sample_size, n_analyzed), True
-
-
-def run_detection(
-    method: DetectionMethod,
+def run_hybrid_pipeline(
     csv_path: Path,
     departamento: str,
     ciudad: str | None,
     year: int,
     *,
-    sample_mode: str = "automatico",
-    sample_size: int = DEFAULT_SAMPLE_SIZE,
     seed: int = DEFAULT_SEED,
     contamination: float = DEFAULT_CONTAMINATION,
     alert_percentile: float = 95.0,
-    min_entity_contracts: int = DEFAULT_MIN_ENTITY,
-    window_days: int = DEFAULT_WINDOW_DAYS,
+    weight_rules: float = DEFAULT_WEIGHT_RULES,
+    weight_if: float = DEFAULT_WEIGHT_IF,
+    burst_window_days: int = DEFAULT_BURST_WINDOW_DAYS,
+    burst_min_contracts: int = DEFAULT_BURST_MIN_CONTRACTS,
+    min_pair_contracts: int = MIN_PAIR_CONTRACTS,
     display_limit: int = 500,
-) -> DetectionResult:
-    counts = detection_population_counts(csv_path, departamento, ciudad, year)
-    if method == DetectionMethod.AGGREGATE_PAIR:
-        return _run_aggregate_pair(
-            csv_path,
-            departamento,
-            ciudad,
-            year,
-            counts=counts,
-            seed=seed,
-            contamination=contamination,
-            alert_percentile=alert_percentile,
-            window_days=window_days,
-            display_limit=display_limit,
-        )
-
-    if sample_mode == "automatico":
-        eff_mode = "muestra" if counts.n_analyzed > AUTO_FULL_THRESHOLD else "completo"
-    else:
-        eff_mode = sample_mode
-    limit, used_sample = _resolve_sample_limit(
-        counts.n_analyzed,
-        eff_mode,
-        sample_size,
-    )
-
-    df = fetch_analyzable_contracts_df(
+) -> HybridPipelineResult:
+    counts = pipeline_population_counts(csv_path, departamento, ciudad, year)
+    pairs = fetch_pair_aggregates_df(
         csv_path,
         departamento,
         ciudad,
         year,
-        limit=limit,
-        seed=seed,
+        burst_window_days=burst_window_days,
     )
-    n_scored = len(df)
-    if n_scored == 0:
-        empty = pd.DataFrame(
-            columns=[
-                "id_contrato",
-                "nombre_entidad",
-                "proveedor",
-                "modalidad",
-                "valor_num",
-                "duracion_dias",
-                "anomaly_score",
-                "es_alerta",
-                "razon_sospecha",
-            ]
-        )
-        return DetectionResult(
-            method=method,
-            counts=counts,
-            n_scored=0,
-            n_alerts=0,
-            used_sample=used_sample,
-            sample_size_requested=limit,
-            ranking=empty,
-            meta={"eff_sample_mode": eff_mode},
-        )
 
-    df = _enrich_features(df)
-
-    if method == DetectionMethod.GLOBAL_IF:
-        scores = _scores_global_if(df, seed=seed, contamination=contamination)
-    elif method == DetectionMethod.HYBRID:
-        scores = _scores_hybrid(df, seed=seed, contamination=contamination)
-    elif method == DetectionMethod.PER_ENTITY:
-        scores = _scores_per_entity(
-            df,
-            seed=seed,
-            contamination=contamination,
-            min_entity_contracts=min_entity_contracts,
-        )
-    elif method == DetectionMethod.TEXT_NUMERIC:
-        scores = _scores_text_numeric(df, seed=seed, contamination=contamination)
-    else:
-        raise ValueError(f"Método no soportado: {method}")
-
-    df = df.assign(anomaly_score=scores)
-    es_alerta = _apply_alert_threshold(df["anomaly_score"], alert_percentile)
-    df = df.assign(es_alerta=es_alerta)
-    feat_cols = _base_feature_matrix(df)[1]
-    df["razon_sospecha"] = df.apply(lambda r: _explain_row(r, df, feat_cols), axis=1)
-
-    ranking = (
-        df.loc[df["es_alerta"]]
-        .sort_values("anomaly_score", ascending=False)
-        .head(display_limit)
-    )
-    ranking = ranking[
-        [
-            "id_contrato",
-            "nombre_entidad",
+    empty_rank = pd.DataFrame(
+        columns=[
             "nit_entidad",
+            "nombre_entidad",
+            "doc_proveedor",
             "proveedor",
-            "modalidad",
-            "tipo_contrato",
-            "ciudad",
-            "valor_num",
-            "duracion_dias",
-            "costo_por_dia",
-            "anomaly_score",
-            "es_alerta",
-            "razon_sospecha",
+            "n_contratos",
+            "suma_valor",
+            "score_final",
+            "score_reglas",
+            "score_anomalia",
+            "reglas_disparadas",
+            "razon_priorizacion",
+            "alerta",
         ]
-    ].rename(columns={"anomaly_score": "score", "es_alerta": "alerta"})
-
-    return DetectionResult(
-        method=method,
-        counts=counts,
-        n_scored=n_scored,
-        n_alerts=int(es_alerta.sum()),
-        used_sample=used_sample,
-        sample_size_requested=limit,
-        ranking=ranking,
-        meta={"eff_sample_mode": eff_mode, "alert_percentile": alert_percentile},
     )
 
-
-def _scores_global_if(
-    df: pd.DataFrame,
-    *,
-    seed: int,
-    contamination: float,
-) -> pd.Series:
-    X, _ = _base_feature_matrix(df)
-    return pd.Series(_fit_isolation_scores(X, contamination=contamination, seed=seed), index=df.index)
-
-
-def _scores_hybrid(df: pd.DataFrame, *, seed: int, contamination: float) -> pd.Series:
-    X, _ = _base_feature_matrix(df)
-    if_score = pd.Series(
-        _fit_isolation_scores(X, contamination=contamination, seed=seed),
-        index=df.index,
-    )
-    rule_score = _rule_component_scores(df)
-    if_n = (if_score - if_score.min()) / (if_score.max() - if_score.min() + 1e-9)
-    rule_n = (rule_score - rule_score.min()) / (rule_score.max() - rule_score.min() + 1e-9)
-    return 0.6 * if_n + 0.4 * rule_n
-
-
-def _scores_per_entity(
-    df: pd.DataFrame,
-    *,
-    seed: int,
-    contamination: float,
-    min_entity_contracts: int,
-) -> pd.Series:
-    scores = pd.Series(0.0, index=df.index)
-    X_all, _ = _base_feature_matrix(df)
-    global_sc = _fit_isolation_scores(X_all, contamination=contamination, seed=seed)
-    global_by_idx = pd.Series(global_sc, index=df.index)
-
-    for nit, grp in df.groupby("nit_entidad", dropna=False):
-        idx = grp.index
-        if len(grp) < min_entity_contracts:
-            scores.loc[idx] = global_by_idx.loc[idx]
-            continue
-        X, _ = _base_feature_matrix(grp)
-        local = _fit_isolation_scores(X, contamination=contamination, seed=seed)
-        scores.loc[idx] = local
-    return scores
-
-
-def _scores_text_numeric(df: pd.DataFrame, *, seed: int, contamination: float) -> pd.Series:
-    X, _ = _text_numeric_matrix(df)
-    return pd.Series(_fit_isolation_scores(X, contamination=contamination, seed=seed), index=df.index)
-
-
-def _run_aggregate_pair(
-    csv_path: Path,
-    departamento: str,
-    ciudad: str | None,
-    year: int,
-    *,
-    counts: DetectionCounts,
-    seed: int,
-    contamination: float,
-    alert_percentile: float,
-    window_days: int,
-    display_limit: int,
-) -> DetectionResult:
-    agg = fetch_aggregate_pairs_df(
-        csv_path,
-        departamento,
-        ciudad,
-        year,
-        window_days=window_days,
-    )
-    if agg.empty:
-        empty = pd.DataFrame(
-            columns=[
-                "nit_e",
-                "nombre_e",
-                "nombre_p",
-                "n_contratos_ventana",
-                "score",
-                "alerta",
-                "razon_sospecha",
-            ]
-        )
-        return DetectionResult(
-            method=DetectionMethod.AGGREGATE_PAIR,
+    if pairs.empty:
+        return HybridPipelineResult(
             counts=counts,
-            n_scored=0,
+            n_pairs=0,
+            n_pairs_scored=0,
             n_alerts=0,
-            used_sample=False,
-            sample_size_requested=None,
-            ranking=empty,
-            meta={"window_days": window_days},
+            ranking=empty_rank,
+            rule_catalog=rule_catalog_df(),
+            meta={"burst_window_days": burst_window_days},
         )
 
-    feat_cols = [
-        "n_contratos_ventana",
-        "sum_valor_ventana",
-        "avg_valor_ventana",
-        "ratio_directa_ventana",
-    ]
-    X = agg[feat_cols].astype(float).replace([np.inf, -np.inf], np.nan).fillna(0)
-    agg = agg.assign(anomaly_score=_fit_isolation_scores(X, contamination=contamination, seed=seed))
-    es_alerta = _apply_alert_threshold(agg["anomaly_score"], alert_percentile)
-    agg = agg.assign(es_alerta=es_alerta)
+    scored = pairs[pairs["n_contratos"] >= min_pair_contracts].copy()
+    n_pairs = len(pairs)
+    n_scored = len(scored)
 
-    def _agg_reason(row: pd.Series) -> str:
-        bits: list[str] = []
-        if row["n_contratos_ventana"] >= agg["n_contratos_ventana"].quantile(0.95):
-            bits.append("muchos contratos en ventana")
-        if row["ratio_directa_ventana"] >= 0.8:
-            bits.append("alta proporción contratación directa")
-        if row["sum_valor_ventana"] >= agg["sum_valor_ventana"].quantile(0.95):
-            bits.append("suma de valores en ventana muy alta")
-        return "; ".join(bits) if bits else "patrón agregado atípico entidad–proveedor"
+    if n_scored < 2:
+        return HybridPipelineResult(
+            counts=counts,
+            n_pairs=n_pairs,
+            n_pairs_scored=n_scored,
+            n_alerts=0,
+            ranking=empty_rank,
+            rule_catalog=rule_catalog_df(),
+            meta={"burst_window_days": burst_window_days, "min_pair_contracts": min_pair_contracts},
+        )
 
-    agg["razon_sospecha"] = agg.apply(_agg_reason, axis=1)
+    costo_p90 = float(scored["costo_dia_promedio"].quantile(0.90))
+    score_reglas, flags = _compute_rule_scores(
+        scored,
+        burst_min_contracts=burst_min_contracts,
+        costo_dia_p90=costo_p90,
+    )
+
+    X = _if_feature_matrix(scored)
+    raw_if = _fit_if_scores(X, contamination=contamination, seed=seed)
+    score_if = _normalize_01(pd.Series(raw_if, index=scored.index))
+
+    wr = weight_rules / max(weight_rules + weight_if, 1e-9)
+    wif = weight_if / max(weight_rules + weight_if, 1e-9)
+    score_final = (wr * score_reglas + wif * score_if).clip(0.0, 1.0)
+
+    scored = scored.assign(
+        score_reglas=score_reglas,
+        score_anomalia=score_if,
+        score_final=score_final,
+    )
+
+    thr = float(np.percentile(score_final, alert_percentile))
+    scored["alerta"] = score_final >= thr
+
+    explanations = []
+    for idx in scored.index:
+        explanations.append(
+            _build_explanation(
+                scored.loc[idx],
+                flags.loc[idx],
+                float(score_reglas.loc[idx]),
+                float(score_if.loc[idx]),
+            )
+        )
+    scored["reglas_disparadas"] = flags["reglas_disparadas"].values
+    scored["razon_priorizacion"] = explanations
 
     ranking = (
-        agg.loc[agg["es_alerta"]]
-        .sort_values("anomaly_score", ascending=False)
+        scored.loc[scored["alerta"]]
+        .sort_values("score_final", ascending=False)
         .head(display_limit)
         .rename(
             columns={
-                "anomaly_score": "score",
-                "es_alerta": "alerta",
+                "nit_e": "nit_entidad",
                 "nombre_e": "nombre_entidad",
+                "doc_p": "doc_proveedor",
                 "nombre_p": "proveedor",
             }
         )[
             [
-                "nit_e",
+                "nit_entidad",
                 "nombre_entidad",
-                "doc_p",
+                "doc_proveedor",
                 "proveedor",
-                "n_contratos_ventana",
-                "sum_valor_ventana",
-                "ratio_directa_ventana",
-                "score",
+                "n_contratos",
+                "suma_valor",
+                "ratio_directa",
+                "concentracion_entidad",
+                "max_contratos_ventana",
+                "score_final",
+                "score_reglas",
+                "score_anomalia",
+                "reglas_disparadas",
+                "razon_priorizacion",
                 "alerta",
-                "razon_sospecha",
             ]
         ]
     )
 
-    return DetectionResult(
-        method=DetectionMethod.AGGREGATE_PAIR,
+    return HybridPipelineResult(
         counts=counts,
-        n_scored=len(agg),
-        n_alerts=int(es_alerta.sum()),
-        used_sample=False,
-        sample_size_requested=None,
+        n_pairs=n_pairs,
+        n_pairs_scored=n_scored,
+        n_alerts=int(scored["alerta"].sum()),
         ranking=ranking,
-        meta={"window_days": window_days, "alert_percentile": alert_percentile},
+        rule_catalog=rule_catalog_df(),
+        meta={
+            "burst_window_days": burst_window_days,
+            "burst_min_contracts": burst_min_contracts,
+            "alert_percentile": alert_percentile,
+            "weight_rules": wr,
+            "weight_if": wif,
+            "costo_dia_p90": costo_p90,
+            "min_pair_contracts": min_pair_contracts,
+        },
     )
+
+
+# Compatibilidad con imports antiguos
+detection_population_counts = pipeline_population_counts
+DetectionCounts = PipelineCounts
