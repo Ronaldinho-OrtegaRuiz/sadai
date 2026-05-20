@@ -501,10 +501,6 @@ if geo is not None and norm_map:
                     f"<span style='color:#d946ef'>■</span> Ciudad activa <b>{ciudad_sel}</b>: "
                     f"<b>{n_city_leyenda:,}</b> contratos"
                 )
-            leyenda_parts.append(
-                "<sub>Clic en un municipio con nombre SECOP: aplica ciudad; "
-                "repite el mismo clic para quitar (o «Todas las ciudades» en el lateral).</sub>"
-            )
             fig_dep.update_layout(
                 margin=dict(l=0, r=0, t=36, b=104),
                 height=520,
@@ -560,10 +556,6 @@ if geo is not None and norm_map:
 
     if sin_match:
         with st.expander(f"Departamentos del export sin emparejar al mapa ({len(sin_match)})"):
-            st.caption(
-                "Puedes ampliar alias en `src/sadai/colombia_geo.py` (`_MANUAL_NORM_TO_DPTO`) "
-                "o añadir un GeoJSON local con otra ortografía."
-            )
             st.dataframe(pd.DataFrame({"Departamento (export)": sin_match}), hide_index=True)
 
 st.subheader("Ranking")
